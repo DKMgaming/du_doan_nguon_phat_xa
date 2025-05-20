@@ -13,15 +13,37 @@ import numpy as np
 import joblib
 from io import BytesIO
 
+import streamlit as st
+import pandas as pd
+import re
+import math
+import folium
+from folium import Marker
+from streamlit_folium import st_folium
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import joblib
+from io import BytesIO
+
 st.set_page_config(page_title="Dự đoán tọa độ nguồn phát xạ", layout="wide")
 st.title("📡 Dự đoán tọa độ nguồn phát xạ từ dữ liệu trạm kiểm soát")
 
-# Hàm xử lý tọa độ từ chuỗi dạng '10.421 N, 105.432 E'
+# Hàm xử lý tọa độ định dạng DMS sang độ thập phân
+def dms_to_decimal(dms_str):
+    parts = re.findall(r"\d+", dms_str)
+    if len(parts) == 3:
+        degrees, minutes, seconds = map(int, parts)
+        return degrees + minutes / 60 + seconds / 3600
+    return None
+
+# Hàm xử lý tọa độ từ chuỗi dạng DMS (ví dụ: 105'44'19 hoặc 09'59'45)
 def parse_coordinates(coord_str):
     try:
-        match = re.match(r"([\d\.]+)\s*[\u00B0\sNn]?,?\s*([\d\.]+)\s*[\u00B0\sEe]?", coord_str)
-        if match:
-            lat, lon = float(match.group(1)), float(match.group(2))
+        parts = coord_str.strip().split()
+        if len(parts) == 2:
+            lon = dms_to_decimal(parts[0])
+            lat = dms_to_decimal(parts[1])
             return lat, lon
         else:
             return None, None
@@ -91,12 +113,8 @@ if uploaded_file:
         y_lat_pred = model_lat.predict(X_test)
         y_lon_pred = model_lon.predict(X_test)
 
-        rmse_lat = np.sqrt(mean_squared_error(y_lat_test, y_lat_pred))
-        rmse_lon = np.sqrt(mean_squared_error(y_lon_test, y_lon_pred))
-
-        st.write(f"RMSE vĩ độ: {rmse_lat:.6f}")
-        st.write(f"RMSE kinh độ: {rmse_lon:.6f}")
-
+        st.write(f"RMSE vĩ độ: {mean_squared_error(y_lat_test, y_lat_pred, squared=False):.6f}")
+        st.write(f"RMSE kinh độ: {mean_squared_error(y_lon_test, y_lon_pred, squared=False):.6f}")
 
         joblib.dump(model_lat, "model_lat.joblib")
         joblib.dump(model_lon, "model_lon.joblib")
