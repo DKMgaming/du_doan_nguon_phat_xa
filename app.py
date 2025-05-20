@@ -13,18 +13,7 @@ import numpy as np
 import joblib
 from io import BytesIO
 
-import streamlit as st
-import pandas as pd
-import re
-import math
-import folium
-from folium import Marker
-from streamlit_folium import st_folium
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-import joblib
-from io import BytesIO
+
 
 st.set_page_config(page_title="Dự đoán tọa độ nguồn phát xạ", layout="wide")
 st.title("📡 Dự đoán tọa độ nguồn phát xạ từ dữ liệu trạm kiểm soát")
