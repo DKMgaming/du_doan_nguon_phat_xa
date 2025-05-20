@@ -8,6 +8,8 @@ from streamlit_folium import st_folium
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error
+import numpy as np
 import joblib
 from io import BytesIO
 
@@ -89,8 +91,12 @@ if uploaded_file:
         y_lat_pred = model_lat.predict(X_test)
         y_lon_pred = model_lon.predict(X_test)
 
-        st.write(f"RMSE vĩ độ: {mean_squared_error(y_lat_test, y_lat_pred, squared=False):.6f}")
-        st.write(f"RMSE kinh độ: {mean_squared_error(y_lon_test, y_lon_pred, squared=False):.6f}")
+        rmse_lat = np.sqrt(mean_squared_error(y_lat_test, y_lat_pred))
+        rmse_lon = np.sqrt(mean_squared_error(y_lon_test, y_lon_pred))
+
+        st.write(f"RMSE vĩ độ: {rmse_lat:.6f}")
+        st.write(f"RMSE kinh độ: {rmse_lon:.6f}")
+
 
         joblib.dump(model_lat, "model_lat.joblib")
         joblib.dump(model_lon, "model_lon.joblib")
