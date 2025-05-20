@@ -13,8 +13,6 @@ import numpy as np
 import joblib
 from io import BytesIO
 
-
-
 st.set_page_config(page_title="Dự đoán tọa độ nguồn phát xạ", layout="wide")
 st.title("📡 Dự đoán tọa độ nguồn phát xạ từ dữ liệu trạm kiểm soát")
 
