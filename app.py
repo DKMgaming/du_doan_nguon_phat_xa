@@ -1,146 +1,322 @@
 import streamlit as st
-import pandas as pd
-import re
-import math
-import folium
-from folium import Marker
-from streamlit_folium import st_folium
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import mean_squared_error
+import os
 import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import joblib
 from io import BytesIO
+from math import atan2, degrees, radians, sin, cos, sqrt
+import folium
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Dự đoán tọa độ nguồn phát xạ", layout="wide")
-st.title("📡 Dự đoán tọa độ nguồn phát xạ từ dữ liệu trạm kiểm soát")
-
-# Hàm xử lý tọa độ định dạng DMS sang độ thập phân
-def dms_to_decimal(dms_str):
-    parts = re.findall(r"\d+", dms_str)
-    if len(parts) == 3:
-        degrees, minutes, seconds = map(int, parts)
-        return degrees + minutes / 60 + seconds / 3600
-    return None
-
-# Hàm xử lý tọa độ từ chuỗi dạng DMS (ví dụ: 105'44'19 hoặc 09'59'45)
-def parse_coordinates(coord_str):
-    try:
-        parts = coord_str.strip().split()
-        if len(parts) == 2:
-            lon = dms_to_decimal(parts[0])
-            lat = dms_to_decimal(parts[1])
-            return lat, lon
-        else:
-            return None, None
-    except:
-        return None, None
-
-# Hàm tính Azimuth giữa hai điểm địa lý
+# Hàm phụ (giữ nguyên)
 def calculate_azimuth(lat1, lon1, lat2, lon2):
-    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
-    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
-    d_lon = lon2_rad - lon1_rad
-    x = math.sin(d_lon) * math.cos(lat2_rad)
-    y = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(d_lon)
-    azimuth_rad = math.atan2(x, y)
-    azimuth_deg = (math.degrees(azimuth_rad) + 360) % 360
-    return azimuth_deg
+    d_lon = radians(lon2 - lon1)
+    lat1 = radians(lat1)
+    lat2 = radians(lat2)
+    x = sin(d_lon) * cos(lat2)
+    y = cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(d_lon)
+    azimuth = (degrees(atan2(x, y)) + 360) % 360
+    return azimuth
 
-# Hàm tiền xử lý file Excel để tạo tập dữ liệu huấn luyện
-def preprocess_xlsm(file):
-    df = pd.read_excel(file)
-    df = df.dropna(subset=["ControlDevicePosition1", "RadiationPosition1"])
-    lat_rx, lon_rx, lat_tx, lon_tx = [], [], [], []
+def calculate_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0  # km
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    d_lat = lat2 - lat1
+    d_lon = lon2 - lon1
+    a = sin(d_lat / 2)**2 + cos(lat1) * cos(lat2) * sin(d_lon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
 
-    for _, row in df.iterrows():
-        lat1, lon1 = parse_coordinates(str(row["ControlDevicePosition1"]))
-        lat2, lon2 = parse_coordinates(str(row["RadiationPosition1"]))
-        if None not in (lat1, lon1, lat2, lon2):
-            lat_rx.append(lat1)
-            lon_rx.append(lon1)
-            lat_tx.append(lat2)
-            lon_tx.append(lon2)
+def dBm_to_dBµV_m(dBm):
+    return dBm + 120
 
-    df_processed = pd.DataFrame({
-        "Lat_RX": lat_rx,
-        "Lon_RX": lon_rx,
-        "Lat_TX": lat_tx,
-        "Lon_TX": lon_tx
-    })
-    df_processed["Azimuth"] = df_processed.apply(
-        lambda row: calculate_azimuth(row["Lat_RX"], row["Lon_RX"], row["Lat_TX"], row["Lon_TX"]), axis=1
-    )
-    return df_processed[["Lat_RX", "Lon_RX", "Azimuth", "Lat_TX", "Lon_TX"]]
+def simulate_signal_strength(dist_km, h, freq_mhz):
+    if dist_km <= 0 or h <= 0 or freq_mhz <= 0:
+        raise ValueError("Các tham số phải > 0.")
+    path_loss = 32.45 + 20 * np.log10(dist_km + 0.1) + 20 * np.log10(freq_mhz + 1)
+    signal_dBm = -30 - path_loss + 10 * np.log10(h + 1)
+    return dBm_to_dBµV_m(signal_dBm)
 
-uploaded_file = st.file_uploader("📤 Tải lên file dữ liệu Excel (.xlsm hoặc .xlsx)", type=["xlsm", "xlsx"])
+def calculate_destination(lat1, lon1, azimuth_deg, distance_km):
+    if distance_km <= 0:
+        raise ValueError("Khoảng cách phải > 0.")
+    if not (-90 <= lat1 <= 90) or not (-180 <= lon1 <= 180):
+        raise ValueError("Tọa độ không hợp lệ.")
+    R = 6371.0
+    brng = radians(azimuth_deg)
+    lat1 = radians(lat1)
+    lon1 = radians(lon1)
+    lat2 = np.arcsin(sin(lat1) * cos(distance_km / R) + cos(lat1) * sin(distance_km / R) * cos(brng))
+    lon2 = lon1 + atan2(sin(brng) * sin(distance_km / R) * cos(lat1), cos(distance_km / R) - sin(lat1) * sin(lat2))
+    return degrees(lat2), degrees(lon2)
 
-if uploaded_file:
-    with st.spinner("Đang xử lý dữ liệu..."):
-        df = preprocess_xlsm(uploaded_file)
-        st.success("✅ Dữ liệu đã được xử lý!")
-        st.dataframe(df.head())
+def azimuth_to_vector(azimuth_deg):
+    azimuth_rad = np.deg2rad(azimuth_deg)
+    dx = np.sin(azimuth_rad)
+    dy = np.cos(azimuth_rad)
+    return dx, dy
 
-    if st.button("🚀 Huấn luyện mô hình"):
-        X = df[["Lat_RX", "Lon_RX", "Azimuth"]]
-        y_lat = df["Lat_TX"]
-        y_lon = df["Lon_TX"]
+def compute_intersection_from_azimuths(lat1, lon1, az1, lat2, lon2, az2):
+    x1, y1 = lon1, lat1
+    dx1, dy1 = azimuth_to_vector(az1)
+    x2, y2 = lon2, lat2
+    dx2, dy2 = azimuth_to_vector(az2)
+    A = np.array([[dx1, -dx2],
+                  [dy1, -dy2]])
+    b = np.array([x2 - x1, y2 - y1])
+    try:
+        t, s = np.linalg.solve(A, b)
+        x_int = x1 + t * dx1
+        y_int = y1 + t * dy1
+        return y_int, x_int
+    except np.linalg.LinAlgError:
+        return None
 
-        X_train, X_test, y_lat_train, y_lat_test, y_lon_train, y_lon_test = train_test_split(
-            X, y_lat, y_lon, test_size=0.2, random_state=42
-        )
+# Giao diện Streamlit
+st.set_page_config(layout="wide")
+st.title("🔭 Dự đoán tọa độ nguồn phát xạ theo hướng định vị")
 
-        model_lat = RandomForestRegressor(n_estimators=100, random_state=42)
-        model_lon = RandomForestRegressor(n_estimators=100, random_state=42)
+tab1, tab2 = st.tabs(["1. Huấn luyện mô hình", "2. Dự đoán tọa độ"])
 
-        model_lat.fit(X_train, y_lat_train)
-        model_lon.fit(X_train, y_lon_train)
+# --- Tab 1: Huấn luyện ---
+with tab1:
+    st.subheader("📡 Huấn luyện mô hình với dữ liệu mô phỏng hoặc thực tế")
 
-        y_lat_pred = model_lat.predict(X_test)
-        y_lon_pred = model_lon.predict(X_test)
+    option = st.radio("Chọn nguồn dữ liệu huấn luyện:", ("Sinh dữ liệu mô phỏng", "Tải file Excel dữ liệu thực tế"))
 
-        st.write(f"RMSE vĩ độ: {mean_squared_error(y_lat_test, y_lat_pred, squared=False):.6f}")
-        st.write(f"RMSE kinh độ: {mean_squared_error(y_lon_test, y_lon_pred, squared=False):.6f}")
+    df = None
 
-        joblib.dump(model_lat, "model_lat.joblib")
-        joblib.dump(model_lon, "model_lon.joblib")
-        st.success("✅ Đã huấn luyện và lưu mô hình thành công!")
+    if option == "Sinh dữ liệu mô phỏng":
+        if st.button("Huấn luyện mô hình từ dữ liệu mô phỏng"):
+            st.info("Đang sinh dữ liệu mô phỏng...")
+            np.random.seed(42)
+            n_samples = 1000
+            data = []
+            for _ in range(n_samples):
+                lat_tx = np.random.uniform(10.0, 21.0)
+                lon_tx = np.random.uniform(105.0, 109.0)
+                lat_rx = lat_tx + np.random.uniform(-0.05, 0.05)
+                lon_rx = lon_tx + np.random.uniform(-0.05, 0.05)
+                h_rx = np.random.uniform(2, 100)
+                freq = np.random.uniform(30, 2600)
+                height_tx = np.random.uniform(10, 200)  # Độ cao anten nguồn phát
+                power_tx = np.random.uniform(10, 1000)  # Công suất nguồn phát (W)
 
-    st.markdown("---")
-    st.subheader("🔮 Dự đoán tọa độ nguồn phát xạ")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        input_lat_rx = st.number_input("Vĩ độ trạm RX", format="%f")
-    with col2:
-        input_lon_rx = st.number_input("Kinh độ trạm RX", format="%f")
-    with col3:
-        input_azimuth = st.number_input("Góc phương vị (Azimuth)", min_value=0.0, max_value=360.0, format="%f")
+                azimuth = calculate_azimuth(lat_rx, lon_rx, lat_tx, lon_tx)
+                distance = sqrt((lat_tx - lat_rx)**2 + (lon_tx - lon_rx)**2) * 111
+                signal = simulate_signal_strength(distance, h_rx, freq)
 
-    if st.button("📍 Dự đoán tọa độ TX"):
+                data.append({
+                    "lat_receiver": lat_rx,
+                    "lon_receiver": lon_rx,
+                    "antenna_height": h_rx,
+                    "azimuth": azimuth,
+                    "frequency": freq,
+                    "signal_strength": signal,
+                    "distance_km": distance,
+                    "height_tx": height_tx,
+                    "power_tx": power_tx
+                })
+
+            df = pd.DataFrame(data)
+            st.success("Dữ liệu mô phỏng đã được sinh thành công!")
+            st.dataframe(df.head())
+
+            towrite = BytesIO()
+            df.to_excel(towrite, index=False, engine='openpyxl')
+            towrite.seek(0)
+            st.download_button(
+                label="📥 Tải dữ liệu mô phỏng (.xlsx)",
+                data=towrite,
+                file_name="simulation_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        uploaded_data = st.file_uploader("📂 Tải file Excel dữ liệu thực tế", type=["xlsx"])
+        if uploaded_data:
+            df = pd.read_excel(uploaded_data)
+            st.success("Đã tải dữ liệu thực tế.")
+            st.dataframe(df.head())
+        else:
+            st.info("Vui lòng tải file dữ liệu để huấn luyện.")
+
+    if df is not None and st.button("🔧 Tiến hành huấn luyện mô hình"):
         try:
-            model_lat = joblib.load("model_lat.joblib")
-            model_lon = joblib.load("model_lon.joblib")
-            input_df = pd.DataFrame([[input_lat_rx, input_lon_rx, input_azimuth]], columns=["Lat_RX", "Lon_RX", "Azimuth"])
-            pred_lat = model_lat.predict(input_df)[0]
-            pred_lon = model_lon.predict(input_df)[0]
-            st.success(f"📡 Dự đoán tọa độ nguồn phát xạ: ({pred_lat:.6f}, {pred_lon:.6f})")
+            st.info("Đang huấn luyện mô hình...")
 
-            m = folium.Map(location=[input_lat_rx, input_lon_rx], zoom_start=12)
-            Marker([input_lat_rx, input_lon_rx], tooltip="Trạm RX", icon=folium.Icon(color='blue')).add_to(m)
-            Marker([pred_lat, pred_lon], tooltip="Dự đoán TX", icon=folium.Icon(color='red')).add_to(m)
-            st_folium(m, width=700, height=500)
+            df['azimuth_sin'] = np.sin(np.radians(df['azimuth']))
+            df['azimuth_cos'] = np.cos(np.radians(df['azimuth']))
 
-            csv_data = pd.DataFrame({
-                "Lat_RX": [input_lat_rx],
-                "Lon_RX": [input_lon_rx],
-                "Azimuth": [input_azimuth],
-                "Lat_TX_DuDoan": [pred_lat],
-                "Lon_TX_DuDoan": [pred_lon]
-            })
-            csv_buffer = BytesIO()
-            csv_data.to_csv(csv_buffer, index=False)
-            st.download_button("📥 Tải kết quả dự đoán", data=csv_buffer.getvalue(), file_name="du_doan_toa_do_TX.csv", mime="text/csv")
+            X = df[['lat_receiver', 'lon_receiver', 'antenna_height', 'signal_strength', 'frequency', 'azimuth_sin', 'azimuth_cos', 'height_tx', 'power_tx']]
+            y = df['distance_km']
 
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+            param_dist = {
+                'n_estimators': [100, 200, 300],
+                'max_depth': [3, 6, 9],
+                'learning_rate': [0.05, 0.1],
+                'subsample': [0.7, 0.8],
+                'colsample_bytree': [0.7, 0.8]
+            }
+
+            model = XGBRegressor(random_state=42)
+            random_search = RandomizedSearchCV(estimator=model, param_distributions=param_dist, n_iter=5, cv=3, random_state=42)
+
+            st.info("Đang thực hiện RandomizedSearchCV để tìm tham số tối ưu...")
+            random_search.fit(X_train, y_train)
+
+            best_model = random_search.best_estimator_
+
+            y_pred = best_model.predict(X_test)
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+
+            st.success(f"Huấn luyện xong - MAE khoảng cách: {mae:.3f} km")
+            st.success(f"RMSE: {rmse:.3f} km")
+            st.success(f"R²: {r2:.3f}")
+
+            model_path = "distance_model_new.joblib"
+            joblib.dump(best_model, model_path)
+
+            buffer = BytesIO()
+            joblib.dump(best_model, buffer)
+            buffer.seek(0)
+
+            st.download_button(
+                label="📥 Tải mô hình huấn luyện (.joblib)",
+                data=buffer,
+                file_name="distance_model.joblib",
+                mime="application/octet-stream"
+            )
         except Exception as e:
-            st.error(f"Lỗi khi tải mô hình hoặc dự đoán: {e}")
+            st.error(f"Đã xảy ra lỗi trong quá trình huấn luyện: {e}")
+            st.exception(e)
+
+# --- Tab 2: Dự đoán ---
+with tab2:
+    st.subheader("📍 Dự đoán tọa độ nguồn phát xạ")
+
+    model = None
+    model_path = "distance_model_2.joblib"
+
+    if os.path.exists(model_path):
+        model = joblib.load(model_path)
+        st.success("✅ Đã tải mô hình từ file local.")
+    else:
+        uploaded_model = st.file_uploader("📂 Tải mô hình đã huấn luyện (.joblib)", type=["joblib"])
+        if uploaded_model is not None:
+            with open(model_path, "wb") as f:
+                f.write(uploaded_model.read())
+            model = joblib.load(model_path)
+            st.success("✅ Đã tải mô hình từ file được tải lên.")
+        else:
+            st.warning("⚠️ Chưa có mô hình. Vui lòng tải lên file `.joblib`.")
+
+    if model is not None:
+        st.write("Sẵn sàng dự đoán...")
+
+        uploaded_excel = st.file_uploader("📄 Hoặc tải file Excel chứa thông tin các trạm thu", type=["xlsx"])
+
+        if uploaded_excel:
+            df_input = pd.read_excel(uploaded_excel)
+            if not all(col in df_input.columns for col in ['height_tx', 'power_tx']):
+                st.error("File Excel cần có cột 'height_tx' và 'power_tx' để dự đoán.")
+            else:
+                results = []
+                st.session_state['intersection_points'] = []
+                m = folium.Map(location=[df_input['lat_receiver'].mean(), df_input['lon_receiver'].mean()], zoom_start=8)
+
+                for _, row in df_input.iterrows():
+                    az_sin = np.sin(np.radians(row['azimuth']))
+                    az_cos = np.cos(np.radians(row['azimuth']))
+                    X_input = np.array([[row['lat_receiver'], row['lon_receiver'], row['antenna_height'], row['signal_strength'], row['frequency'], az_sin, az_cos, row['height_tx'], row['power_tx']]])
+                    predicted_distance = model.predict(X_input)[0]
+                    predicted_distance = max(predicted_distance, 0.1)
+
+                    lat_pred, lon_pred = calculate_destination(row['lat_receiver'], row['lon_receiver'], row['azimuth'], predicted_distance)
+
+                    folium.Marker(
+                        [lat_pred, lon_pred],
+                        tooltip=f"Nguồn phát dự đoán\nTần số: {row['frequency']} MHz\nMức tín hiệu: {row['signal_strength']} dBµV/m",
+                        icon=folium.Icon(color='red')
+                    ).add_to(m)
+
+                    folium.Marker([row['lat_receiver'], row['lon_receiver']], tooltip="Trạm thu", icon=folium.Icon(color='blue')).add_to(m)
+                    folium.PolyLine(locations=[[row['lat_receiver'], row['lon_receiver']], [lat_pred, lon_pred]], color='green').add_to(m)
+
+                    results.append({
+                        "lat_receiver": row['lat_receiver'],
+                        "lon_receiver": row['lon_receiver'],
+                        "lat_pred": lat_pred,
+                        "lon_pred": lon_pred,
+                        "predicted_distance_km": predicted_distance,
+                        "frequency": row['frequency'],
+                        "signal_strength": row['signal_strength'],
+                        "height_tx": row['height_tx'],
+                        "power_tx": row['power_tx']
+                    })
+
+                st.dataframe(pd.DataFrame(results))
+
+                if st.button("Tính điểm giao cắt nếu 1 tần số được thu từ 2 trạm"):
+                    frequency_groups = df_input.groupby('frequency')
+                    for freq, group in frequency_groups:
+                        if len(group) >= 2:
+                            for i in range(len(group)):
+                                for j in range(i + 1, len(group)):
+                                    row1 = group.iloc[i]
+                                    row2 = group.iloc[j]
+                                    azimuth1 = row1['azimuth']
+                                    azimuth2 = row2['azimuth']
+                                    lat1, lon1 = row1['lat_receiver'], row1['lon_receiver']
+                                    lat2, lon2 = row2['lat_receiver'], row2['lon_receiver']
+                                    intersection_lat, intersection_lon = compute_intersection_from_azimuths(lat1, lon1, azimuth1, lat2, lon2, azimuth2)
+                                    if intersection_lat is not None and intersection_lon is not None:
+                                        folium.Marker([intersection_lat, intersection_lon], tooltip=f"Tọa độ nguồn phát tần số {freq} MHz là {intersection_lat:.4f},{intersection_lon:.4f}", icon=folium.Icon(color='green')).add_to(m)
+                                        st.write(f"Tọa độ điểm giao cắt cho tần số {freq} MHz là: {intersection_lat:.4f} / {intersection_lon:.4f}")
+                                        st.session_state['intersection_points'].append((intersection_lat, intersection_lon))
+
+                with st.container():
+                    st_folium(m, width=1300, height=500, returned_objects=[])
+        else:
+            with st.form("input_form"):
+                lat_rx = st.number_input("Vĩ độ trạm thu", value=21.339)
+                lon_rx = st.number_input("Kinh độ trạm thu", value=105.4056)
+                h_rx = st.number_input("Chiều cao anten (m)", value=30.0)
+                signal = st.number_input("Mức tín hiệu thu (dBµV/m)", value=50.0)
+                freq = st.number_input("Tần số (MHz)", value=900.0)
+                azimuth = st.number_input("Góc phương vị (độ)", value=45.0)
+                height_tx = st.number_input("Chiều cao anten nguồn phát (m)", value=50.0)
+                power_tx = st.number_input("Công suất nguồn phát (W)", value=100.0)
+                submitted = st.form_submit_button("🔍 Dự đoán tọa độ nguồn phát")
+
+            if submitted:
+                az_sin = np.sin(np.radians(azimuth))
+                az_cos = np.cos(np.radians(azimuth))
+                X_input = np.array([[lat_rx, lon_rx, h_rx, signal, freq, az_sin, az_cos, height_tx, power_tx]])
+                predicted_distance = model.predict(X_input)[0]
+                predicted_distance = max(predicted_distance, 0.1)
+
+                lat_pred, lon_pred = calculate_destination(lat_rx, lon_rx, azimuth, predicted_distance)
+
+                st.success("🎯 Tọa độ nguồn phát xạ dự đoán:")
+                st.markdown(f"- **Vĩ độ**: `{lat_pred:.6f}`")
+                st.markdown(f"- **Kinh độ**: `{lon_pred:.6f}`")
+                st.markdown(f"- **Khoảng cách dự đoán**: `{predicted_distance:.2f} km`")
+
+                m = folium.Map(location=[lat_rx, lon_rx], zoom_start=10)
+                folium.Marker([lat_rx, lon_rx], tooltip="Trạm thu", icon=folium.Icon(color='blue')).add_to(m)
+                folium.Marker(
+                    [lat_pred, lon_pred],
+                    tooltip=f"Nguồn phát dự đoán\nTần số: {freq} MHz\nMức tín hiệu: {signal} dBµV/m",
+                    icon=folium.Icon(color='red')
+                ).add_to(m)
+                folium.PolyLine(locations=[[lat_rx, lon_rx], [lat_pred, lon_pred]], color='green').add_to(m)
+
+                with st.container():
+                    st_folium(m, width=1300, height=500, returned_objects=[])
