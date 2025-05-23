@@ -102,8 +102,8 @@ with tab1:
                 lon_rx = lon_tx + np.random.uniform(-0.05, 0.05)
                 h_rx = np.random.uniform(2, 100)
                 freq = np.random.uniform(30, 2600)
-                height_tx = np.random.uniform(10, 200)  # Độ cao anten nguồn phát
-                power_tx = np.random.uniform(10, 1000)  # Công suất nguồn phát (W)
+                height_tx = np.random.uniform(10, 100)  # Độ cao anten nguồn phát
+                power_tx = np.random.uniform(5, 1000)  # Công suất nguồn phát (W)
 
                 azimuth = calculate_azimuth(lat_rx, lon_rx, lat_tx, lon_tx)
                 distance = sqrt((lat_tx - lat_rx)**2 + (lon_tx - lon_rx)**2) * 111
